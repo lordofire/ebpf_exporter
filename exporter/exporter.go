@@ -58,8 +58,9 @@ type Exporter struct {
 	cgroupMonitor            *cgroup.Monitor
 }
 
-// New creates a new exporter with the provided config
-func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Provider, btfPath string) (*Exporter, error) {
+// New creates a new exporter with the provided config.
+// kubecontextCacheSize is the LRU cache size for the kubecontext resolver; 0 disables kubecontext decoders.
+func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Provider, btfPath string, kubecontextCacheSize int) (*Exporter, error) {
 	enabledConfigsDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(prometheusNamespace, "", "enabled_configs"),
 		"The set of enabled configs",
@@ -109,7 +110,11 @@ func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Pro
 		return nil, fmt.Errorf("error creating cgroup monitor: %w", err)
 	}
 
-	decoders, err := decoder.NewSet(skipCacheSize, monitor)
+	kubeResolver, err := decoder.NewKubeResolver(monitor, decoder.NoopKubeBackend{}, kubecontextCacheSize)
+	if err != nil {
+		return nil, fmt.Errorf("error creating kubecontext resolver: %w", err)
+	}
+	decoders, err := decoder.NewSet(skipCacheSize, monitor, kubeResolver)
 	if err != nil {
 		return nil, fmt.Errorf("error creating decoder set: %w", err)
 	}

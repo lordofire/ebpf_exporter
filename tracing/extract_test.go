@@ -151,7 +151,7 @@ func TestExtractFilled(t *testing.T) {
 		},
 	}
 
-	decoders, err := decoder.NewSet(0, nil)
+	decoders, err := decoder.NewSet(0, nil, nil)
 	if err != nil {
 		t.Fatalf("Error creating decoders set: %v", err)
 	}
