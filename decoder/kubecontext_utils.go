@@ -3,7 +3,6 @@ package decoder
 import (
 	"context"
 	"errors"
-	"log"
 	"os"
 	"strings"
 	"sync"
@@ -64,9 +63,6 @@ func NewK8sKubeBackend() (KubeBackend, error) {
 		nodeName: nodeName,
 		cache:    make(map[string]podCacheValue),
 	}
-	if debugDecode && b.nodeName == "" {
-		log.Printf("[kube:debug] K8sKubeBackend: NODE_NAME unset; Resolve will return error")
-	}
 	return b, nil
 }
 
@@ -103,9 +99,6 @@ func (b *K8sKubeBackend) Resolve(containerID, podUID string) (PodMeta, bool, err
 		if attempt < listPodsRetries-1 {
 			time.Sleep(listPodsBackoff * time.Duration(attempt+1))
 		} else {
-			if debugDecode {
-				log.Printf("[kube:debug] list pods err: %v", err)
-			}
 			return PodMeta{}, false, err
 		}
 	}
