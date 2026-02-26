@@ -1,4 +1,7 @@
 /ebpf_exporter
 /libbpf
+ebpf-exporter*
 
 .DS_Store
+.cursor
+generated

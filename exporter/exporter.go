@@ -58,8 +58,10 @@ type Exporter struct {
 	cgroupMonitor            *cgroup.Monitor
 }
 
-// New creates a new exporter with the provided config
-func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Provider, btfPath string) (*Exporter, error) {
+// New creates a new exporter with the provided config.
+// kubecontextEnable enables pod/namespace/container resolution from cgroup (K8s API when in cluster); when false, labels stay unknown.
+// procfsPath is the root of the proc filesystem for PID→cgroup resolution (e.g. "/proc" or "/host/proc"); must be non-empty (caller sets default at parse time).
+func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Provider, btfPath string, kubecontextEnable bool, procfsPath string) (*Exporter, error) {
 	enabledConfigsDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(prometheusNamespace, "", "enabled_configs"),
 		"The set of enabled configs",
@@ -109,7 +111,21 @@ func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Pro
 		return nil, fmt.Errorf("error creating cgroup monitor: %w", err)
 	}
 
-	decoders, err := decoder.NewSet(skipCacheSize, monitor)
+	var kubeBackend decoder.KubeBackend = decoder.NoopKubeBackend{}
+	if kubecontextEnable {
+		if backend, err := decoder.NewK8sKubeBackend(); err == nil {
+			kubeBackend = backend
+			log.Printf("Using Kubernetes API backend for pod/namespace resolution (service account)")
+		} else {
+			log.Printf("Kubernetes API backend unavailable (not in cluster?): %v; pod/namespace labels will be unknown", err)
+		}
+	}
+
+	kubeResolver, err := decoder.NewKubeResolver(monitor, kubeBackend, procfsPath)
+	if err != nil {
+		return nil, fmt.Errorf("error creating kubecontext resolver: %w", err)
+	}
+	decoders, err := decoder.NewSet(skipCacheSize, monitor, kubeResolver)
 	if err != nil {
 		return nil, fmt.Errorf("error creating decoder set: %w", err)
 	}

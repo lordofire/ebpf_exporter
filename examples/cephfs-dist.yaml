@@ -1,12 +1,29 @@
 metrics:
   histograms:
     - name: cephfs_latency_seconds
-      help: cephfs IO latency histogram
+      help: cephfs IO latency histogram with pod/namespace/container labels (kubecontext from process ID / TGID)
       bucket_type: exp2
       bucket_min: 0
       bucket_max: 27
       bucket_multiplier: 0.000001 # microseconds to seconds
       labels:
+        - name: namespace
+          size: 4
+          reuse: true
+          decoders:
+            - name: uint
+            - name: kube_namespace_from_pid
+        - name: pod
+          size: 4
+          reuse: true
+          decoders:
+            - name: uint
+            - name: kube_pod_name_from_pid
+        - name: container
+          size: 4
+          decoders:
+            - name: uint
+            - name: kube_container_name_from_pid
         - name: operation
           size: 1
           decoders:

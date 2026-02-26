@@ -29,8 +29,7 @@ type Set struct {
 	skipCache *lru.Cache[string, struct{}]
 }
 
-// NewSet creates a Set with all known decoders
-func NewSet(skipCacheSize int, monitor *cgroup.Monitor) (*Set, error) {
+func NewSet(skipCacheSize int, monitor *cgroup.Monitor, resolver *KubeResolver) (*Set, error) {
 	ksym, err := kallsyms.NewDecoder("/proc/kallsyms")
 	if err != nil {
 		return nil, fmt.Errorf("error creating ksym decoder: %w", err)
@@ -38,24 +37,32 @@ func NewSet(skipCacheSize int, monitor *cgroup.Monitor) (*Set, error) {
 
 	s := &Set{
 		decoders: map[string]Decoder{
-			"cgroup":       &CGroup{monitor},
-			"dname":        &Dname{},
-			"errno":        &Errno{},
-			"hex":          &Hex{},
-			"ifname":       &IfName{},
-			"inet_ip":      &InetIP{},
-			"kstack":       &KStack{ksym},
-			"ksym":         &KSym{ksym},
-			"majorminor":   &MajorMinor{},
-			"pci_class":    &PCIClass{},
-			"pci_device":   &PCIDevice{},
-			"pci_subclass": &PCISubClass{},
-			"pci_vendor":   &PCIVendor{},
-			"regexp":       &Regexp{},
-			"static_map":   &StaticMap{},
-			"string":       &String{},
-			"syscall":      &Syscall{},
-			"uint":         &UInt{},
+			"cgroup":                            &CGroup{monitor},
+			"dname":                             &Dname{},
+			"errno":                             &Errno{},
+			"hex":                               &Hex{},
+			"ifname":                            &IfName{},
+			"inet_ip":                           &InetIP{},
+			"kstack":                            &KStack{ksym},
+			"ksym":                              &KSym{ksym},
+			"kube_container_name_from_cgroupid": &KubeContainerNameFromCgroupID{Resolver: resolver},
+			"kube_container_name_from_pid":      &KubeContainerNameFromPID{Resolver: resolver},
+			"kube_namespace_from_cgroupid":      &KubeNamespaceFromCgroupID{Resolver: resolver},
+			"kube_namespace_from_pid":           &KubeNamespaceFromPID{Resolver: resolver},
+			"kube_pod_name_from_cgroupid":       &KubePodNameFromCgroupID{Resolver: resolver},
+			"kube_pod_name_from_pid":            &KubePodNameFromPID{Resolver: resolver},
+			"kube_pod_uid_from_cgroupid":        &KubePodUIDFromCgroupID{Resolver: resolver},
+			"kube_pod_uid_from_pid":             &KubePodUIDFromPID{Resolver: resolver},
+			"majorminor":                        &MajorMinor{},
+			"pci_class":                         &PCIClass{},
+			"pci_device":                        &PCIDevice{},
+			"pci_subclass":                      &PCISubClass{},
+			"pci_vendor":                        &PCIVendor{},
+			"regexp":                            &Regexp{},
+			"static_map":                        &StaticMap{},
+			"string":                            &String{},
+			"syscall":                           &Syscall{},
+			"uint":                              &UInt{},
 		},
 		cache: map[string]map[string][]string{},
 	}
@@ -130,7 +137,6 @@ func (s *Set) DecodeLabelsForMetrics(in []byte, name string, labels []config.Lab
 	}
 
 	cache[string(in)] = values
-
 	return values, nil
 }
 
@@ -144,41 +150,32 @@ func (s *Set) DecodeLabelsForTracing(in []byte, labels []config.Label) ([]string
 	return s.decodeLabels(in, labels)
 }
 
-// decodeLabels is the inner function of DecodeLabels without any caching
+// decodeLabels is the inner function of DecodeLabels without any caching.
+// When a label has Reuse set, the read offset is not advanced for the next label.
 func (s *Set) decodeLabels(in []byte, labels []config.Label) ([]string, error) {
 	values := make([]string, len(labels))
-
 	off := uint(0)
 
-	totalSize := uint(0)
-	for _, label := range labels {
+	for i, label := range labels {
 		size := label.Size
 		if size == 0 {
 			return nil, fmt.Errorf("error decoding label %q: size is zero or not set", label.Name)
 		}
-
-		totalSize += size + label.Padding
-	}
-
-	if totalSize != uint(len(in)) {
-		return nil, fmt.Errorf("error decoding labels: total size of key %#v is %d bytes, but we have labels to decode %d", in, len(in), totalSize)
-	}
-
-	for i, label := range labels {
+		if uint(len(in)) < off+size {
+			return nil, fmt.Errorf("error decoding labels: total size of key %#v is %d bytes, but we need at least %d", in, len(in), off+size)
+		}
 		if len(label.Decoders) == 0 {
 			return nil, fmt.Errorf("error decoding label %q: no decoders set", label.Name)
 		}
-
-		size := label.Size
-
-		decoded, err := s.decode(in[off:off+size], label)
+		slice := in[off : off+size]
+		decoded, err := s.decode(slice, label)
 		if err != nil {
 			return nil, err
 		}
-
-		off += size + label.Padding
-
 		values[i] = string(decoded)
+		if !label.Reuse {
+			off += size + label.Padding
+		}
 	}
 
 	return values, nil

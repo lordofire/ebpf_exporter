@@ -149,7 +149,7 @@ func TestDecodeLabels(t *testing.T) {
 	}
 
 	for i, c := range cases {
-		s, err := NewSet(0, nil)
+		s, err := NewSet(0, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -255,7 +255,7 @@ func TestDecodeSkipLabels(t *testing.T) {
 	}
 
 	for i, c := range cases {
-		s, err := NewSet(100, nil)
+		s, err := NewSet(100, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -322,7 +322,7 @@ func TestDecoderSetConcurrency(t *testing.T) {
 		},
 	}
 
-	s, err := NewSet(0, nil)
+	s, err := NewSet(0, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,6 +349,43 @@ func TestDecoderSetConcurrency(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+func TestDecodeLabelsReuse(t *testing.T) {
+	// Two labels with reuse: true both read the same 8 bytes; key size is 8, not 16.
+	in := []byte{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} // uint64(1) in little endian
+	labels := []config.Label{
+		{
+			Name:  "a",
+			Size:  8,
+			Reuse: true,
+			Decoders: []config.Decoder{
+				{Name: "uint"},
+			},
+		},
+		{
+			Name:  "b",
+			Size:  8,
+			Reuse: true,
+			Decoders: []config.Decoder{
+				{Name: "uint"},
+			},
+		},
+	}
+	s, err := NewSet(0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := s.DecodeLabelsForMetrics(in, "reuse", labels)
+	if err != nil {
+		t.Fatalf("DecodeLabelsForMetrics: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 labels, got %d", len(out))
+	}
+	if out[0] != "1" || out[1] != "1" {
+		t.Errorf("expected [\"1\", \"1\"], got %q", out)
+	}
 }
 
 func TestDecoderSetCache(t *testing.T) {
@@ -387,7 +424,7 @@ func TestDecoderSetCache(t *testing.T) {
 		},
 	}
 
-	s, err := NewSet(0, nil)
+	s, err := NewSet(0, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +495,7 @@ func BenchmarkCache(b *testing.B) {
 		},
 	}
 
-	s, err := NewSet(0, nil)
+	s, err := NewSet(0, nil, nil)
 	if err != nil {
 		b.Fatal(err)
 	}

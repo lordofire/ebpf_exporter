@@ -87,6 +87,7 @@ type Label struct {
 	Name     string    `yaml:"name"`
 	Size     uint      `yaml:"size"`
 	Padding  uint      `yaml:"padding"`
+	Reuse    bool      `yaml:"reuse"`
 	Decoders []Decoder `yaml:"decoders"`
 }
 
