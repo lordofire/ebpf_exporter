@@ -1,8 +1,12 @@
 package decoder
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"strconv"
 	"sync"
 
 	"github.com/cloudflare/ebpf_exporter/v2/cgroup"
@@ -10,6 +14,14 @@ import (
 	"github.com/cloudflare/ebpf_exporter/v2/kallsyms"
 	lru "github.com/hashicorp/golang-lru/v2"
 )
+
+// debugDecode enables [decode:debug] and [kube:debug] logs when EBPF_EXPORTER_DEBUG_DECODE=1.
+var debugDecode bool
+
+func init() {
+	v, _ := strconv.ParseBool(os.Getenv("EBPF_EXPORTER_DEBUG_DECODE"))
+	debugDecode = v
+}
 
 // ErrSkipLabelSet instructs exporter to skip label set
 var ErrSkipLabelSet = errors.New("this label set should be skipped")
@@ -29,8 +41,6 @@ type Set struct {
 	skipCache *lru.Cache[string, struct{}]
 }
 
-// NewSet creates a Set with all known decoders. If resolver is non-nil, kube
-// decoders (kube_pod_name, kube_namespace, kube_container_name, kube_pod_uid) are registered.
 func NewSet(skipCacheSize int, monitor *cgroup.Monitor, resolver *KubeResolver) (*Set, error) {
 	ksym, err := kallsyms.NewDecoder("/proc/kallsyms")
 	if err != nil {
@@ -39,28 +49,32 @@ func NewSet(skipCacheSize int, monitor *cgroup.Monitor, resolver *KubeResolver) 
 
 	s := &Set{
 		decoders: map[string]Decoder{
-			"cgroup":              &CGroup{monitor},
-			"dname":               &Dname{},
-			"errno":               &Errno{},
-			"hex":                 &Hex{},
-			"ifname":              &IfName{},
-			"inet_ip":             &InetIP{},
-			"kstack":              &KStack{ksym},
-			"ksym":                &KSym{ksym},
-			"majorminor":          &MajorMinor{},
-			"pci_class":           &PCIClass{},
-			"pci_device":          &PCIDevice{},
-			"pci_subclass":        &PCISubClass{},
-			"pci_vendor":          &PCIVendor{},
-			"regexp":              &Regexp{},
-			"static_map":          &StaticMap{},
-			"string":              &String{},
-			"syscall":             &Syscall{},
-			"uint":                &UInt{},
-			"kube_pod_name":       &KubePodName{Resolver: resolver},
-			"kube_namespace":      &KubeNamespace{Resolver: resolver},
-			"kube_container_name": &KubeContainerName{Resolver: resolver},
-			"kube_pod_uid":        &KubePodUID{Resolver: resolver},
+			"cgroup":                            &CGroup{monitor},
+			"dname":                             &Dname{},
+			"errno":                             &Errno{},
+			"hex":                               &Hex{},
+			"ifname":                            &IfName{},
+			"inet_ip":                           &InetIP{},
+			"kstack":                            &KStack{ksym},
+			"ksym":                              &KSym{ksym},
+			"kube_container_name_from_cgroupid": &KubeContainerNameFromCgroupID{Resolver: resolver},
+			"kube_container_name_from_pid":      &KubeContainerNameFromPID{Resolver: resolver},
+			"kube_namespace_from_cgroupid":      &KubeNamespaceFromCgroupID{Resolver: resolver},
+			"kube_namespace_from_pid":           &KubeNamespaceFromPID{Resolver: resolver},
+			"kube_pod_name_from_cgroupid":       &KubePodNameFromCgroupID{Resolver: resolver},
+			"kube_pod_name_from_pid":            &KubePodNameFromPID{Resolver: resolver},
+			"kube_pod_uid_from_cgroupid":        &KubePodUIDFromCgroupID{Resolver: resolver},
+			"kube_pod_uid_from_pid":             &KubePodUIDFromPID{Resolver: resolver},
+			"majorminor":                        &MajorMinor{},
+			"pci_class":                         &PCIClass{},
+			"pci_device":                        &PCIDevice{},
+			"pci_subclass":                      &PCISubClass{},
+			"pci_vendor":                        &PCIVendor{},
+			"regexp":                            &Regexp{},
+			"static_map":                        &StaticMap{},
+			"string":                            &String{},
+			"syscall":                           &Syscall{},
+			"uint":                              &UInt{},
 		},
 		cache: map[string]map[string][]string{},
 	}
@@ -118,6 +132,9 @@ func (s *Set) DecodeLabelsForMetrics(in []byte, name string, labels []config.Lab
 	// string(in) must not be a variable to avoid allocation:
 	// * https://github.com/golang/go/commit/f5f5a8b6209f8
 	if cached, ok := cache[string(in)]; ok {
+		if debugDecode {
+			log.Printf("[decode:debug] metric %q cache HIT key=%s values=%q", name, hex.EncodeToString(in), cached)
+		}
 		return cached, nil
 	}
 
@@ -125,17 +142,25 @@ func (s *Set) DecodeLabelsForMetrics(in []byte, name string, labels []config.Lab
 	// and return the error early.
 	if s.skipCache != nil {
 		if _, ok := s.skipCache.Get(string(in)); ok {
+			if debugDecode {
+				log.Printf("[decode:debug] metric %q skip-cache HIT key=%s", name, hex.EncodeToString(in))
+			}
 			return nil, ErrSkipLabelSet
 		}
 	}
 
 	values, err := s.decodeLabels(in, labels)
 	if err != nil {
+		if debugDecode {
+			log.Printf("[decode:debug] metric %q decodeLabels err key=%s err=%v", name, hex.EncodeToString(in), err)
+		}
 		return nil, err
 	}
 
 	cache[string(in)] = values
-
+	if debugDecode {
+		log.Printf("[decode:debug] metric %q cache MISS (decoded) key=%s values=%q", name, hex.EncodeToString(in), values)
+	}
 	return values, nil
 }
 
@@ -166,11 +191,27 @@ func (s *Set) decodeLabels(in []byte, labels []config.Label) ([]string, error) {
 		if len(label.Decoders) == 0 {
 			return nil, fmt.Errorf("error decoding label %q: no decoders set", label.Name)
 		}
-		decoded, err := s.decode(in[off:off+size], label)
+		slice := in[off : off+size]
+		if debugDecode {
+			names := make([]string, len(label.Decoders))
+			for j, d := range label.Decoders {
+				names[j] = d.Name
+			}
+			log.Printf("[decode:debug] label[%d] name=%q offset=%d size=%d reuse=%v decoders=%v slice_hex=%s",
+				i, label.Name, off, size, label.Reuse, names, hex.EncodeToString(slice))
+		}
+		decoded, err := s.decode(slice, label)
 		if err != nil {
 			return nil, err
 		}
 		values[i] = string(decoded)
+		if debugDecode {
+			v := string(decoded)
+			if len(v) > 64 {
+				v = v[:64] + "..."
+			}
+			log.Printf("[decode:debug] label[%d] name=%q => %q", i, label.Name, v)
+		}
 		if !label.Reuse {
 			off += size + label.Padding
 		}

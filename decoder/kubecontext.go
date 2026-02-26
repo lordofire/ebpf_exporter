@@ -1,6 +1,8 @@
 package decoder
 
 import (
+	"bufio"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -9,7 +11,6 @@ import (
 
 	"github.com/cloudflare/ebpf_exporter/v2/cgroup"
 	"github.com/cloudflare/ebpf_exporter/v2/config"
-	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 // PodMeta is the normalized Kubernetes pod identity returned by backends.
@@ -22,21 +23,22 @@ type PodMeta struct {
 
 // KubeBackend resolves container ID and pod UID to Kubernetes pod metadata.
 // Implementations may use CRI, K8s API, or Docker.
+// When err != nil the caller should propagate it so the metric decode fails (e.g. missing NODE_NAME).
 type KubeBackend interface {
-	Resolve(containerID, podUID string) (PodMeta, bool)
+	Resolve(containerID, podUID string) (PodMeta, bool, error)
 }
 
 // NoopKubeBackend returns unknown for all lookups. Used when no runtime backend is configured.
 type NoopKubeBackend struct{}
 
 // Resolve implements KubeBackend.
-func (NoopKubeBackend) Resolve(_, _ string) (PodMeta, bool) {
+func (NoopKubeBackend) Resolve(_, _ string) (PodMeta, bool, error) {
 	return PodMeta{
 		Pod:       "unknown",
 		Namespace: "unknown",
 		Container: "unknown",
 		PodUID:    "unknown",
-	}, false
+	}, false, nil
 }
 
 // ParseCgroupPath extracts pod UID and container ID from a cgroup path.
@@ -103,64 +105,92 @@ func ParseCgroupPath(path string) (podUID, containerID string, ok bool) {
 	return "", "", false
 }
 
-// KubeResolver resolves cgroup ID to PodMeta using cgroup monitor, path parsing, and a backend.
-// Results are cached by cgroup path to avoid repeated lookups.
+// CgroupPathFromPID returns the cgroup path for the given process ID by reading
+// /proc/<pid>/cgroup (Option A). Prefers the unified cgroup v2 line (0::/path) if
+// present, otherwise uses the first line. Returns empty string if the process
+// does not exist or the file cannot be read (e.g. PID reuse, process gone).
+func CgroupPathFromPID(pidStr string) string {
+	pid, err := strconv.Atoi(pidStr)
+	if err != nil || pid <= 0 {
+		return ""
+	}
+	f, err := os.Open("/proc/" + strconv.Itoa(pid) + "/cgroup")
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	var unified, first string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		path := strings.TrimPrefix(parts[2], "/")
+		if first == "" {
+			first = path
+		}
+		// cgroup v2: hierarchy 0, empty controller list
+		if parts[0] == "0" && parts[1] == "" {
+			unified = path
+			break
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return first
+	}
+	if unified != "" {
+		return unified
+	}
+	return first
+}
+
+// KubeResolver resolves cgroup ID or PID to PodMeta. Path resolution is by
+// cgroup monitor (ID→path) or /proc (PID→path); then a shared path→PodMeta
+// step (parse, backend, cache by path).
 type KubeResolver struct {
 	monitor *cgroup.Monitor
 	backend KubeBackend
-	cache   *lru.Cache[string, PodMeta]
+	cache   map[string]PodMeta
 	mu      sync.Mutex
 }
 
-// NewKubeResolver creates a resolver with the given cgroup monitor, backend, and cache size.
-// If cacheSize <= 0, no cache is used.
-func NewKubeResolver(monitor *cgroup.Monitor, backend KubeBackend, cacheSize int) (*KubeResolver, error) {
+// NewKubeResolver creates a resolver with the given cgroup monitor and backend.
+func NewKubeResolver(monitor *cgroup.Monitor, backend KubeBackend) (*KubeResolver, error) {
 	r := &KubeResolver{
 		monitor: monitor,
 		backend: backend,
 	}
-	if cacheSize > 0 {
-		cache, err := lru.New[string, PodMeta](cacheSize)
-		if err != nil {
-			return nil, err
-		}
-		r.cache = cache
-	}
+	r.cache = make(map[string]PodMeta)
 	return r, nil
 }
 
-// Resolve resolves a cgroup ID (as decimal string) to PodMeta.
-func (r *KubeResolver) Resolve(cgroupIDStr string) (PodMeta, bool) {
-	cgroupID, err := strconv.Atoi(cgroupIDStr)
-	if err != nil {
-		return PodMeta{}, false
+// resolvePath is the shared path→PodMeta logic: cache lookup, parse path,
+// backend resolve, cache by path. Used by both ResolveByCgroupID and ResolveByPID.
+func (r *KubeResolver) resolvePath(path string) (PodMeta, bool, error) {
+	if path == "" {
+		return PodMeta{}, false, nil
 	}
-	path := r.monitor.Resolve(cgroupID)
-	if path == "" || strings.HasPrefix(path, "unknown_cgroup_id:") {
-		return PodMeta{}, false
-	}
-
 	if r.cache != nil {
 		r.mu.Lock()
-		if meta, ok := r.cache.Get(path); ok {
+		if meta, ok := r.cache[path]; ok {
 			r.mu.Unlock()
-			return meta, true
+			return meta, true, nil
 		}
 		r.mu.Unlock()
 	}
 
 	podUID, containerID, ok := ParseCgroupPath(path)
 	if !ok {
-		unknown := PodMeta{Pod: "unknown", Namespace: "unknown", Container: "unknown", PodUID: "unknown"}
-		if r.cache != nil {
-			r.mu.Lock()
-			r.cache.Add(path, unknown)
-			r.mu.Unlock()
-		}
-		return unknown, true
+		return PodMeta{Pod: "unknown", Namespace: "unknown", Container: "unknown", PodUID: "unknown"}, true, nil
 	}
 
-	meta, found := r.backend.Resolve(containerID, podUID)
+	meta, found, err := r.backend.Resolve(containerID, podUID)
+	if err != nil {
+		return PodMeta{}, false, err
+	}
 	if !found {
 		meta = PodMeta{Pod: "unknown", Namespace: "unknown", Container: "unknown", PodUID: podUID}
 	} else if meta.PodUID == "" {
@@ -169,64 +199,138 @@ func (r *KubeResolver) Resolve(cgroupIDStr string) (PodMeta, bool) {
 
 	if r.cache != nil {
 		r.mu.Lock()
-		r.cache.Add(path, meta)
+		r.cache[path] = meta
 		r.mu.Unlock()
 	}
-	return meta, true
+	return meta, true, nil
 }
 
-// KubePodName is a decoder that resolves cgroup ID to pod name via KubeResolver.
-type KubePodName struct {
-	Resolver *KubeResolver
+// ResolveByCgroupID resolves a cgroup ID (decimal string) to PodMeta via
+// cgroup monitor (ID→path) then resolvePath.
+func (r *KubeResolver) ResolveByCgroupID(cgroupIDStr string) (PodMeta, bool, error) {
+	cgroupID, err := strconv.Atoi(cgroupIDStr)
+	if err != nil {
+		return PodMeta{}, false, nil
+	}
+	path := r.monitor.Resolve(cgroupID)
+	if path == "" || strings.HasPrefix(path, "unknown_cgroup_id:") {
+		return PodMeta{}, false, nil
+	}
+	return r.resolvePath(path)
 }
 
-// Decode implements Decoder.
-func (k *KubePodName) Decode(in []byte, _ config.Decoder) ([]byte, error) {
-	meta, ok := k.Resolver.Resolve(string(in))
+// ResolveByPID resolves a PID (decimal string) to PodMeta via /proc (PID→path)
+// then resolvePath. Process may be gone or PID reused; returns (PodMeta{}, false, nil) on failure.
+func (r *KubeResolver) ResolveByPID(pidStr string) (PodMeta, bool, error) {
+	path := CgroupPathFromPID(pidStr)
+	if path == "" {
+		return PodMeta{}, false, nil
+	}
+	return r.resolvePath(path)
+}
+
+// kubeDecodeFromMeta maps (meta, ok, err) from a resolver to a label value or error.
+func kubeDecodeFromMeta(_ []byte, meta PodMeta, ok bool, err error, field string) ([]byte, error) {
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return []byte("unknown"), nil
 	}
-	return []byte(meta.Pod), nil
+	switch field {
+	case "Pod":
+		return []byte(meta.Pod), nil
+	case "Namespace":
+		return []byte(meta.Namespace), nil
+	case "Container":
+		return []byte(meta.Container), nil
+	case "PodUID":
+		return []byte(meta.PodUID), nil
+	default:
+		return []byte("unknown"), nil
+	}
 }
 
-// KubeNamespace is a decoder that resolves cgroup ID to namespace via KubeResolver.
-type KubeNamespace struct {
+// --- Decoders: from_cgroupid (input = cgroup ID string) ---
+
+// KubePodNameFromCgroupID resolves cgroup ID to pod name.
+type KubePodNameFromCgroupID struct {
 	Resolver *KubeResolver
 }
 
-// Decode implements Decoder.
-func (k *KubeNamespace) Decode(in []byte, _ config.Decoder) ([]byte, error) {
-	meta, ok := k.Resolver.Resolve(string(in))
-	if !ok {
-		return []byte("unknown"), nil
-	}
-	return []byte(meta.Namespace), nil
+func (k *KubePodNameFromCgroupID) Decode(in []byte, _ config.Decoder) ([]byte, error) {
+	meta, ok, err := k.Resolver.ResolveByCgroupID(string(in))
+	return kubeDecodeFromMeta(in, meta, ok, err, "Pod")
 }
 
-// KubeContainerName is a decoder that resolves cgroup ID to container name via KubeResolver.
-type KubeContainerName struct {
+// KubeNamespaceFromCgroupID resolves cgroup ID to namespace.
+type KubeNamespaceFromCgroupID struct {
 	Resolver *KubeResolver
 }
 
-// Decode implements Decoder.
-func (k *KubeContainerName) Decode(in []byte, _ config.Decoder) ([]byte, error) {
-	meta, ok := k.Resolver.Resolve(string(in))
-	if !ok {
-		return []byte("unknown"), nil
-	}
-	return []byte(meta.Container), nil
+func (k *KubeNamespaceFromCgroupID) Decode(in []byte, _ config.Decoder) ([]byte, error) {
+	meta, ok, err := k.Resolver.ResolveByCgroupID(string(in))
+	return kubeDecodeFromMeta(in, meta, ok, err, "Namespace")
 }
 
-// KubePodUID is a decoder that resolves cgroup ID to pod UID via KubeResolver.
-type KubePodUID struct {
+// KubeContainerNameFromCgroupID resolves cgroup ID to container name.
+type KubeContainerNameFromCgroupID struct {
 	Resolver *KubeResolver
 }
 
-// Decode implements Decoder.
-func (k *KubePodUID) Decode(in []byte, _ config.Decoder) ([]byte, error) {
-	meta, ok := k.Resolver.Resolve(string(in))
-	if !ok {
-		return []byte("unknown"), nil
-	}
-	return []byte(meta.PodUID), nil
+func (k *KubeContainerNameFromCgroupID) Decode(in []byte, _ config.Decoder) ([]byte, error) {
+	meta, ok, err := k.Resolver.ResolveByCgroupID(string(in))
+	return kubeDecodeFromMeta(in, meta, ok, err, "Container")
+}
+
+// KubePodUIDFromCgroupID resolves cgroup ID to pod UID.
+type KubePodUIDFromCgroupID struct {
+	Resolver *KubeResolver
+}
+
+func (k *KubePodUIDFromCgroupID) Decode(in []byte, _ config.Decoder) ([]byte, error) {
+	meta, ok, err := k.Resolver.ResolveByCgroupID(string(in))
+	return kubeDecodeFromMeta(in, meta, ok, err, "PodUID")
+}
+
+// --- Decoders: from_pid (input = PID string) ---
+
+// KubePodNameFromPID resolves PID to pod name.
+type KubePodNameFromPID struct {
+	Resolver *KubeResolver
+}
+
+func (k *KubePodNameFromPID) Decode(in []byte, _ config.Decoder) ([]byte, error) {
+	meta, ok, err := k.Resolver.ResolveByPID(string(in))
+	return kubeDecodeFromMeta(in, meta, ok, err, "Pod")
+}
+
+// KubeNamespaceFromPID resolves PID to namespace.
+type KubeNamespaceFromPID struct {
+	Resolver *KubeResolver
+}
+
+func (k *KubeNamespaceFromPID) Decode(in []byte, _ config.Decoder) ([]byte, error) {
+	meta, ok, err := k.Resolver.ResolveByPID(string(in))
+	return kubeDecodeFromMeta(in, meta, ok, err, "Namespace")
+}
+
+// KubeContainerNameFromPID resolves PID to container name.
+type KubeContainerNameFromPID struct {
+	Resolver *KubeResolver
+}
+
+func (k *KubeContainerNameFromPID) Decode(in []byte, _ config.Decoder) ([]byte, error) {
+	meta, ok, err := k.Resolver.ResolveByPID(string(in))
+	return kubeDecodeFromMeta(in, meta, ok, err, "Container")
+}
+
+// KubePodUIDFromPID resolves PID to pod UID.
+type KubePodUIDFromPID struct {
+	Resolver *KubeResolver
+}
+
+func (k *KubePodUIDFromPID) Decode(in []byte, _ config.Decoder) ([]byte, error) {
+	meta, ok, err := k.Resolver.ResolveByPID(string(in))
+	return kubeDecodeFromMeta(in, meta, ok, err, "PodUID")
 }

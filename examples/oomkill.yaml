@@ -1,35 +1,24 @@
 metrics:
   counters:
     - name: oom_kills_total
-      help: Count global and cgroup level OOMs with pod/namespace/container labels
+      help: Count global and cgroup level OOMs with pod/namespace labels
       perf_event_array: true
       labels:
-        - name: cgroup_path
-          size: 8
-          decoders:
-            - name: uint
-            - name: cgroup
-        - name: container
-          size: 8
-          reuse: true
-          decoders:
-            - name: uint
-            - name: kube_container_name
         - name: namespace
           size: 8
           reuse: true
           decoders:
             - name: uint
-            - name: kube_namespace
+            - name: kube_namespace_from_cgroupid
         - name: pod
           size: 8
           reuse: true
           decoders:
             - name: uint
-            - name: kube_pod_name
+            - name: kube_pod_name_from_cgroupid
         - name: uid
           size: 8
           reuse: true
           decoders:
             - name: uint
-            - name: kube_pod_uid
+            - name: kube_pod_uid_from_cgroupid

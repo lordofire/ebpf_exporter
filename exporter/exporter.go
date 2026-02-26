@@ -59,8 +59,8 @@ type Exporter struct {
 }
 
 // New creates a new exporter with the provided config.
-// kubecontextCacheSize is the LRU cache size for the kubecontext resolver; 0 disables kubecontext decoders.
-func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Provider, btfPath string, kubecontextCacheSize int) (*Exporter, error) {
+// kubecontextEnable enables pod/namespace/container resolution from cgroup (K8s API when in cluster); when false, labels stay unknown.
+func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Provider, btfPath string, kubecontextEnable bool) (*Exporter, error) {
 	enabledConfigsDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(prometheusNamespace, "", "enabled_configs"),
 		"The set of enabled configs",
@@ -110,7 +110,17 @@ func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Pro
 		return nil, fmt.Errorf("error creating cgroup monitor: %w", err)
 	}
 
-	kubeResolver, err := decoder.NewKubeResolver(monitor, decoder.NoopKubeBackend{}, kubecontextCacheSize)
+	var kubeBackend decoder.KubeBackend = decoder.NoopKubeBackend{}
+	if kubecontextEnable {
+		if backend, err := decoder.NewK8sKubeBackend(); err == nil {
+			kubeBackend = backend
+			log.Printf("Using Kubernetes API backend for pod/namespace resolution (service account)")
+		} else {
+			log.Printf("Kubernetes API backend unavailable (not in cluster?): %v; pod/namespace labels will be unknown", err)
+		}
+	}
+
+	kubeResolver, err := decoder.NewKubeResolver(monitor, kubeBackend)
 	if err != nil {
 		return nil, fmt.Errorf("error creating kubecontext resolver: %w", err)
 	}
