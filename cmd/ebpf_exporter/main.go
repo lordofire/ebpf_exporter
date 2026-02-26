@@ -43,6 +43,7 @@ func main() {
 	btfPath := kingpin.Flag("btf.path", "Optional BTF file path.").Default("").String()
 	skipCacheSize := kingpin.Flag("config.skip-cache-size", "Size of the LRU skip cache").Int()
 	kubecontextEnable := kingpin.Flag("kubecontext.enable", "Enable pod/namespace/container resolution from cgroup (Kubernetes API when in cluster)").Default("true").Bool()
+	kubecontextProcfsPath := kingpin.Flag("kubecontext.procfs-path", "Root of the proc filesystem for PID→cgroup resolution (e.g. /host/proc when running in a container with host proc mounted)").Default("/proc").String()
 	kingpin.Version(version.Print("ebpf_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
@@ -94,7 +95,7 @@ func main() {
 
 	notify("creating exporter...")
 
-	e, err := exporter.New(configs, *skipCacheSize, tracing.NewProvider(processor), *btfPath, *kubecontextEnable)
+	e, err := exporter.New(configs, *skipCacheSize, tracing.NewProvider(processor), *btfPath, *kubecontextEnable, *kubecontextProcfsPath)
 	if err != nil {
 		log.Fatalf("Error creating exporter: %s", err)
 	}

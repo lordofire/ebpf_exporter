@@ -2,6 +2,7 @@ package decoder
 
 import (
 	"bufio"
+	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -106,15 +107,16 @@ func ParseCgroupPath(path string) (podUID, containerID string, ok bool) {
 }
 
 // CgroupPathFromPID returns the cgroup path for the given process ID by reading
-// /proc/<pid>/cgroup (Option A). Prefers the unified cgroup v2 line (0::/path) if
-// present, otherwise uses the first line. Returns empty string if the process
-// does not exist or the file cannot be read (e.g. PID reuse, process gone).
-func CgroupPathFromPID(pidStr string) string {
+// <procfsRoot>/<pid>/cgroup. procfsRoot must be non-empty (caller supplies default if needed).
+// Prefers the unified cgroup v2 line (0::/path) if present, otherwise uses the first line.
+// Returns empty string if the process does not exist or the file cannot be read (e.g. PID reuse, process gone).
+func CgroupPathFromPID(procfsRoot string, pidStr string) string {
 	pid, err := strconv.Atoi(pidStr)
 	if err != nil || pid <= 0 {
 		return ""
 	}
-	f, err := os.Open("/proc/" + strconv.Itoa(pid) + "/cgroup")
+	cgroupPath := filepath.Join(procfsRoot, strconv.Itoa(pid), "cgroup")
+	f, err := os.Open(cgroupPath)
 	if err != nil {
 		return ""
 	}
@@ -148,20 +150,26 @@ func CgroupPathFromPID(pidStr string) string {
 }
 
 // KubeResolver resolves cgroup ID or PID to PodMeta. Path resolution is by
-// cgroup monitor (ID→path) or /proc (PID→path); then a shared path→PodMeta
+// cgroup monitor (ID→path) or procfs (PID→path); then a shared path→PodMeta
 // step (parse, backend, cache by path).
 type KubeResolver struct {
-	monitor *cgroup.Monitor
-	backend KubeBackend
-	cache   map[string]PodMeta
-	mu      sync.Mutex
+	monitor    *cgroup.Monitor
+	backend    KubeBackend
+	procfsRoot string // root of procfs for PID→cgroup (e.g. "/proc" or "/host/proc")
+	cache      map[string]PodMeta
+	mu         sync.Mutex
 }
 
-// NewKubeResolver creates a resolver with the given cgroup monitor and backend.
-func NewKubeResolver(monitor *cgroup.Monitor, backend KubeBackend) (*KubeResolver, error) {
+// NewKubeResolver creates a resolver with the given cgroup monitor, backend, and procfs root.
+// procfsRoot is the root of the proc filesystem used to read <procfs>/<pid>/cgroup; must be non-empty (caller sets default at parse time).
+func NewKubeResolver(monitor *cgroup.Monitor, backend KubeBackend, procfsRoot string) (*KubeResolver, error) {
+	if procfsRoot == "" {
+		return nil, errors.New("kubecontext procfs root must be non-empty")
+	}
 	r := &KubeResolver{
-		monitor: monitor,
-		backend: backend,
+		monitor:    monitor,
+		backend:    backend,
+		procfsRoot: procfsRoot,
 	}
 	r.cache = make(map[string]PodMeta)
 	return r, nil
@@ -219,10 +227,10 @@ func (r *KubeResolver) ResolveByCgroupID(cgroupIDStr string) (PodMeta, bool, err
 	return r.resolvePath(path)
 }
 
-// ResolveByPID resolves a PID (decimal string) to PodMeta via /proc (PID→path)
+// ResolveByPID resolves a PID (decimal string) to PodMeta via r.procfsRoot (PID→path)
 // then resolvePath. Process may be gone or PID reused; returns (PodMeta{}, false, nil) on failure.
 func (r *KubeResolver) ResolveByPID(pidStr string) (PodMeta, bool, error) {
-	path := CgroupPathFromPID(pidStr)
+	path := CgroupPathFromPID(r.procfsRoot, pidStr)
 	if path == "" {
 		return PodMeta{}, false, nil
 	}

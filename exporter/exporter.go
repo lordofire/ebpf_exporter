@@ -60,7 +60,8 @@ type Exporter struct {
 
 // New creates a new exporter with the provided config.
 // kubecontextEnable enables pod/namespace/container resolution from cgroup (K8s API when in cluster); when false, labels stay unknown.
-func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Provider, btfPath string, kubecontextEnable bool) (*Exporter, error) {
+// procfsPath is the root of the proc filesystem for PID→cgroup resolution (e.g. "/proc" or "/host/proc"); must be non-empty (caller sets default at parse time).
+func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Provider, btfPath string, kubecontextEnable bool, procfsPath string) (*Exporter, error) {
 	enabledConfigsDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(prometheusNamespace, "", "enabled_configs"),
 		"The set of enabled configs",
@@ -120,7 +121,7 @@ func New(configs []config.Config, skipCacheSize int, tracingProvider tracing.Pro
 		}
 	}
 
-	kubeResolver, err := decoder.NewKubeResolver(monitor, kubeBackend)
+	kubeResolver, err := decoder.NewKubeResolver(monitor, kubeBackend, procfsPath)
 	if err != nil {
 		return nil, fmt.Errorf("error creating kubecontext resolver: %w", err)
 	}
